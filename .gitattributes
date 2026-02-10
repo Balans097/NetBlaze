@@ -1,0 +1,5 @@
+# .gitattributes
+*.html linguist-language=Nim
+
+
+
