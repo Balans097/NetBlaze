@@ -42,9 +42,19 @@ import streams
 const
   MOVIE_ID = "tt0181852"  # Terminator 3: Rise of the Machines
   BASE_URL = "https://www.imdb.com"
-  REVIEWS_URL = BASE_URL & "/title/" & MOVIE_ID & "/reviews"
-  MAX_PAGES = 50  # Максимум страниц для скрейпинга (обычно ~25 отзывов на странице)
-  REQUEST_DELAY = 2000  # Задержка между запросами в миллисекундах
+  # РЕЖИМ ЗАГРУЗКИ:
+  # false = постраничная загрузка (надежно, ~50 секунд для всех отзывов)
+  # true = попытка загрузить все отзывы одним запросом (НЕ РАБОТАЕТ - IMDB игнорирует)
+  LOAD_ALL_AT_ONCE = false
+  
+  # Для режима "загрузить всё сразу" - IMDB игнорирует параметр count
+  ALL_REVIEWS_URL = BASE_URL & "/title/" & MOVIE_ID & "/reviews?sort=submissionDate&dir=desc&ratingFilter=0&count=10000"
+  
+  # Для постраничной загрузки
+  REVIEWS_URL = BASE_URL & "/title/" & MOVIE_ID & "/reviews?sort=submissionDate&dir=desc&ratingFilter=0"
+  
+  MAX_PAGES = 100  # Максимум страниц для скрейпинга (увеличено для получения всех отзывов)
+  REQUEST_DELAY = 500  # Задержка между запросами в миллисекундах (уменьшена для скорости)
 
 # ============================================================================
 # DATA PROCESSORS - Обработчики данных
@@ -245,6 +255,15 @@ proc extractReviewData(scraper: IMDBReviewsScraper, reviewElement: Selector): It
     echo "    ✗ reviewNode is nil"
     return result
   
+  # Отладочная информация - вывод структуры элемента
+  if scraper.stats.itemsScraped == 0:  # Только для первого отзыва
+    echo "    [DEBUG] Review element tag: ", reviewNode.tag
+    echo "    [DEBUG] Review element class: ", reviewNode.attr("class")
+    echo "    [DEBUG] First 200 chars of review HTML: "
+    let htmlText = $reviewNode
+    if htmlText.len > 0:
+      echo "    ", htmlText[0..min(200, htmlText.len-1)]
+  
   let reviewId = reviewNode.getAttr("data-review-id", "")
   if reviewId.len > 0:
     result["review_id"] = %reviewId
@@ -253,66 +272,213 @@ proc extractReviewData(scraper: IMDBReviewsScraper, reviewElement: Selector): It
   # === ИЗВЛЕЧЕНИЕ ДАННЫХ ЧЕРЕЗ ПОИСК В DOM ===
   
   # Заголовок отзыва
-  for node in reviewNode.findAll("a"):
-    if node.kind == xnElement and node.attr("class").contains("title"):
-      let titleText = node.innerText().strip()
-      if titleText.len > 0:
-        result["title"] = %titleText
-        echo "    • title: ", titleText
+  var titleFound = false
+  
+  # Вариант 1: a с классом "title"
+  if not titleFound:
+    for node in reviewNode.findAll("a"):
+      if node.kind == xnElement and node.attr("class").contains("title"):
+        let titleText = node.innerText().strip()
+        if titleText.len > 0:
+          result["title"] = %titleText
+          echo "    • title: ", titleText
+          titleFound = true
+          break
+  
+  # Вариант 2: h3 или h2 заголовки
+  if not titleFound:
+    for tagName in ["h3", "h2", "h1"]:
+      for node in reviewNode.findAll(tagName):
+        if node.kind == xnElement:
+          let titleText = node.innerText().strip()
+          if titleText.len > 0 and titleText.len < 200:  # Разумная длина заголовка
+            result["title"] = %titleText
+            echo "    • title: ", titleText
+            titleFound = true
+            break
+      if titleFound:
         break
+  
+  # Вариант 3: div или span с классом содержащим "title"
+  if not titleFound:
+    for node in reviewNode.findAll("div"):
+      if node.kind == xnElement:
+        let className = node.attr("class")
+        if className.contains("title") or className.contains("headline"):
+          let titleText = node.innerText().strip()
+          if titleText.len > 0 and titleText.len < 200:
+            result["title"] = %titleText
+            echo "    • title: ", titleText
+            titleFound = true
+            break
   
   # Рейтинг
-  for node in reviewNode.findAll("span"):
-    if node.kind == xnElement and node.attr("class").contains("rating-other-user-rating"):
-      for subNode in node.findAll("span"):
-        if subNode.kind == xnElement:
-          let ratingText = subNode.innerText().strip()
-          let pattern = re"(\d+)/10"
-          var matches: array[1, string]
-          if ratingText.find(pattern, matches) != -1:
-            result["rating"] = %matches[0]
-            echo "    • rating: ", matches[0]
-            break
-      break
+  var ratingFound = false
+  let ratingPattern = re"(\d+)/10"
   
-  # Текст отзыва
-  for node in reviewNode.findAll("div"):
-    if node.kind == xnElement and node.attr("class").contains("text") and node.attr("class").contains("show-more__control"):
-      let reviewText = node.innerText().strip()
-      if reviewText.len > 0:
-        result["review_text"] = %reviewText
-        echo "    • review_text: ", reviewText[0..min(50, reviewText.len-1)], "..."
+  # Вариант 1: span с классом "rating-other-user-rating"
+  if not ratingFound:
+    for node in reviewNode.findAll("span"):
+      if node.kind == xnElement and node.attr("class").contains("rating-other-user-rating"):
+        for subNode in node.findAll("span"):
+          if subNode.kind == xnElement:
+            let ratingText = subNode.innerText().strip()
+            var matches: array[1, string]
+            if ratingText.find(ratingPattern, matches) != -1:
+              result["rating"] = %matches[0]
+              echo "    • rating: ", matches[0]
+              ratingFound = true
+              break
         break
   
+  # Вариант 2: ищем любой span или div с рейтингом в формате X/10
+  if not ratingFound:
+    for node in reviewNode.findAll("span"):
+      if node.kind == xnElement:
+        let ratingText = node.innerText().strip()
+        var matches: array[1, string]
+        if ratingText.find(ratingPattern, matches) != -1:
+          let className = node.attr("class")
+          # Исключаем нерелевантные элементы
+          if not className.contains("date") and not className.contains("helpful"):
+            result["rating"] = %matches[0]
+            echo "    • rating: ", matches[0]
+            ratingFound = true
+            break
+  
+  # Вариант 3: ищем в div элементах
+  if not ratingFound:
+    for node in reviewNode.findAll("div"):
+      if node.kind == xnElement:
+        let ratingText = node.innerText().strip()
+        var matches: array[1, string]
+        if ratingText.find(ratingPattern, matches) != -1 and ratingText.len < 20:
+          result["rating"] = %matches[0]
+          echo "    • rating: ", matches[0]
+          ratingFound = true
+          break
+  
+  # Текст отзыва - IMDB использует несколько возможных структур
+  var reviewTextFound = false
+  
+  # Вариант 1: div с классом "text show-more__control"
+  if not reviewTextFound:
+    for node in reviewNode.findAll("div"):
+      if node.kind == xnElement:
+        let className = node.attr("class")
+        if className.contains("text") and className.contains("show-more__control"):
+          let reviewText = node.innerText().strip()
+          if reviewText.len > 0:
+            result["review_text"] = %reviewText
+            echo "    • review_text: ", reviewText[0..min(50, reviewText.len-1)], "..."
+            reviewTextFound = true
+            break
+  
+  # Вариант 2: div с классом просто "text" или "content"
+  if not reviewTextFound:
+    for node in reviewNode.findAll("div"):
+      if node.kind == xnElement:
+        let className = node.attr("class")
+        if (className.contains("text") or className.contains("content")) and 
+           not className.contains("actions"):
+          let reviewText = node.innerText().strip()
+          if reviewText.len > 10:  # Проверка минимальной длины
+            result["review_text"] = %reviewText
+            echo "    • review_text: ", reviewText[0..min(50, reviewText.len-1)], "..."
+            reviewTextFound = true
+            break
+  
+  # Вариант 3: ищем любой div с достаточным количеством текста
+  if not reviewTextFound:
+    for node in reviewNode.findAll("div"):
+      if node.kind == xnElement:
+        let reviewText = node.innerText().strip()
+        # Ищем блок с текстом длиннее 100 символов
+        if reviewText.len > 100:
+          # Проверяем, что это не служебная информация
+          let className = node.attr("class")
+          if not className.contains("actions") and 
+             not className.contains("spoiler-warning") and
+             not className.contains("display-name"):
+            result["review_text"] = %reviewText
+            echo "    • review_text: ", reviewText[0..min(50, reviewText.len-1)], "..."
+            reviewTextFound = true
+            break
+  
   # Автор
-  for node in reviewNode.findAll("span"):
-    if node.kind == xnElement and node.attr("class").contains("display-name-link"):
-      for linkNode in node.findAll("a"):
-        if linkNode.kind == xnElement:
-          let authorText = linkNode.innerText().strip()
-          if authorText.len > 0:
+  var authorFound = false
+  
+  # Вариант 1: span с классом "display-name-link"
+  if not authorFound:
+    for node in reviewNode.findAll("span"):
+      if node.kind == xnElement and node.attr("class").contains("display-name-link"):
+        for linkNode in node.findAll("a"):
+          if linkNode.kind == xnElement:
+            let authorText = linkNode.innerText().strip()
+            if authorText.len > 0:
+              result["author"] = %authorText
+              echo "    • author: ", authorText
+            
+            # URL автора
+            let href = linkNode.attr("href")
+            if href.len > 0:
+              var authorUrl = href
+              if not authorUrl.startsWith("http"):
+                authorUrl = urljoin(BASE_URL, authorUrl)
+              result["author_url"] = %authorUrl
+              echo "    • author_url: ", authorUrl
+            authorFound = true
+            break
+        if authorFound:
+          break
+  
+  # Вариант 2: ищем a с href содержащим "/user/"
+  if not authorFound:
+    for node in reviewNode.findAll("a"):
+      if node.kind == xnElement:
+        let href = node.attr("href")
+        if href.contains("/user/"):
+          let authorText = node.innerText().strip()
+          if authorText.len > 0 and authorText.len < 50:
             result["author"] = %authorText
             echo "    • author: ", authorText
-          
-          # URL автора
-          let href = linkNode.attr("href")
-          if href.len > 0:
+            
             var authorUrl = href
             if not authorUrl.startsWith("http"):
               authorUrl = urljoin(BASE_URL, authorUrl)
             result["author_url"] = %authorUrl
             echo "    • author_url: ", authorUrl
-          break
-      break
+            authorFound = true
+            break
   
   # Дата отзыва
-  for node in reviewNode.findAll("span"):
-    if node.kind == xnElement and node.attr("class").contains("review-date"):
-      let dateText = node.innerText().strip()
-      if dateText.len > 0:
-        result["review_date"] = %dateText
-        echo "    • review_date: ", dateText
-        break
+  var dateFound = false
+  
+  # Вариант 1: span с классом "review-date"
+  if not dateFound:
+    for node in reviewNode.findAll("span"):
+      if node.kind == xnElement and node.attr("class").contains("review-date"):
+        let dateText = node.innerText().strip()
+        if dateText.len > 0:
+          result["review_date"] = %dateText
+          echo "    • review_date: ", dateText
+          dateFound = true
+          break
+  
+  # Вариант 2: ищем span или div с датой (содержит название месяца или год)
+  if not dateFound:
+    let monthPattern = re"(January|February|March|April|May|June|July|August|September|October|November|December)"
+    for node in reviewNode.findAll("span"):
+      if node.kind == xnElement:
+        let dateText = node.innerText().strip()
+        if dateText.find(monthPattern) != -1 or dateText.contains("20"):
+          let className = node.attr("class")
+          # Исключаем элементы с текстом отзыва
+          if not className.contains("text") and dateText.len < 50:
+            result["review_date"] = %dateText
+            echo "    • review_date: ", dateText
+            dateFound = true
+            break
   
   # Количество "полезных" голосов
   for node in reviewNode.findAll("div"):
@@ -438,26 +604,53 @@ proc getNextPageUrl(response: nimbrowser.Response): string =
   if rootNode.isNil:
     return result
   
-  # IMDB использует data-key для пагинации в атрибуте кнопки Load More
-  # Ищем кнопку с классом load-more-data
+  # IMDB использует несколько способов пагинации:
+  
+  # Способ 1: ищем data-key в кнопке "Load More"
   for node in rootNode.findAll("button"):
     if node.kind == xnElement:
       let className = node.attr("class")
-      if className.contains("load-more-data") or className.contains("ipc-see-more"):
-        let dataKey = node.attr("data-key")
-        if dataKey.len > 0:
-          # Формируем URL для следующей страницы
-          result = REVIEWS_URL & "?paginationKey=" & dataKey
-          return result
+      let dataKey = node.attr("data-key")
+      if dataKey.len > 0 and (className.contains("load-more") or className.contains("ipc-see-more")):
+        result = REVIEWS_URL & "/_ajax?paginationKey=" & dataKey
+        echo "  → Found pagination key in button: ", dataKey
+        return result
   
-  # Альтернативный поиск через div с id load-more-trigger
+  # Способ 2: ищем div с id="load-more-trigger" или data-key
   for node in rootNode.findAll("div"):
     if node.kind == xnElement:
-      if node.attr("id") == "load-more-trigger":
-        let dataKey = node.attr("data-key")
-        if dataKey.len > 0:
-          result = REVIEWS_URL & "?paginationKey=" & dataKey
+      let dataKey = node.attr("data-key")
+      if dataKey.len > 0:
+        let id = node.attr("id")
+        let className = node.attr("class")
+        if id.contains("load-more") or className.contains("load-more") or className.contains("pagination"):
+          result = REVIEWS_URL & "/_ajax?paginationKey=" & dataKey
+          echo "  → Found pagination key in div: ", dataKey
           return result
+  
+  # Способ 3: ищем скрытый input с пагинацией
+  for node in rootNode.findAll("input"):
+    if node.kind == xnElement:
+      let name = node.attr("name")
+      let value = node.attr("value")
+      if name == "paginationKey" and value.len > 0:
+        result = REVIEWS_URL & "/_ajax?paginationKey=" & value
+        echo "  → Found pagination key in input: ", value
+        return result
+  
+  # Способ 4: парсим JSON из script тега
+  for node in rootNode.findAll("script"):
+    if node.kind == xnElement:
+      let scriptContent = node.innerText()
+      # Ищем паттерн с paginationKey в JSON
+      let keyPattern = re""""paginationKey"\s*:\s*"([^"]+)""""
+      var matches: array[1, string]
+      if scriptContent.find(keyPattern, matches) != -1:
+        result = REVIEWS_URL & "/_ajax?paginationKey=" & matches[0]
+        echo "  → Found pagination key in script: ", matches[0]
+        return result
+  
+  echo "  → No pagination key found, ending scraping"
 
 proc createMockResponse(pageNum: int): nimbrowser.Response =
   ## Создаёт mock ответ для демонстрации
@@ -589,49 +782,112 @@ proc scrapeAllPages(scraper: IMDBReviewsScraper) {.async.} =
   echo "║ STARTING SCRAPING PROCESS"
   echo "╚════════════════════════════════════════════════════════════════════"
   echo ""
-  echo "  🎯 Target: ", REVIEWS_URL
-  echo "  📄 Max pages: ", MAX_PAGES
-  echo "  ⏱️  Delay: ", REQUEST_DELAY, "ms"
-  echo ""
   
-  var currentUrl = REVIEWS_URL
-  var currentPage = 1
-  
-  while currentUrl.len > 0:
+  # Выбор режима загрузки
+  if LOAD_ALL_AT_ONCE:
+    echo "  📥 Mode: LOAD ALL REVIEWS AT ONCE"
+    echo "  🎯 Target: ", ALL_REVIEWS_URL
+    echo ""
+    
     echo "╔════════════════════════════════════════════════════════════════════"
-    echo "║ PAGE #", currentPage
+    echo "║ LOADING ALL REVIEWS"
     echo "╚════════════════════════════════════════════════════════════════════"
     
     # Middleware: processRequest
-    var request = currentUrl
+    var request = ALL_REVIEWS_URL
     var dummyResponse = new(nimbrowser.Response)
     scraper.loggingMiddleware.processRequest(request, dummyResponse)
     
-    # Выполнение реального HTTP запроса с заголовками
-    let response = await fetchWithHeaders(currentUrl)
-    
+    # Выполнение единственного HTTP запроса
+    let response = await fetchWithHeaders(ALL_REVIEWS_URL)
     scraper.stats.requestsCount += 1
     
     # Middleware: processResponse
     var mutableResponse = response
     scraper.loggingMiddleware.processResponse(request, mutableResponse)
     
-    # Извлечение отзывов
+    # Извлечение всех отзывов
     let reviews = scraper.scrapePage(response)
     scraper.allReviews.add reviews
     
-    # Получение URL следующей страницы
-    currentUrl = getNextPageUrl(response)
+    echo ""
+    echo "  ✅ Loaded ", reviews.len, " reviews in single request"
     
-    if currentUrl.len == 0 or currentPage >= MAX_PAGES:
-      break
+  else:
+    # Постраничная загрузка (старый режим)
+    echo "  📄 Mode: PAGE-BY-PAGE LOADING"
+    echo "  🎯 Target: ", REVIEWS_URL
+    echo "  📄 Max pages: ", MAX_PAGES
+    echo "  ⏱️  Delay: ", REQUEST_DELAY, "ms"
+    echo ""
     
-    currentPage += 1
+    var currentUrl = REVIEWS_URL
+    var currentPage = 1
+    var reviewsPerPage = 25  # Обычно IMDB показывает 25 отзывов на странице
+    var totalReviewsFound = 0
+    var consecutiveEmptyPages = 0
     
-    # Задержка между запросами
-    if currentPage <= MAX_PAGES:
-      echo "⏳ Waiting ", REQUEST_DELAY, "ms before next page..."
-      await sleepAsync(REQUEST_DELAY)
+    while currentUrl.len > 0:
+      echo "╔════════════════════════════════════════════════════════════════════"
+      echo "║ PAGE #", currentPage
+      echo "╚════════════════════════════════════════════════════════════════════"
+      
+      # Middleware: processRequest
+      var request = currentUrl
+      var dummyResponse = new(nimbrowser.Response)
+      scraper.loggingMiddleware.processRequest(request, dummyResponse)
+      
+      # Выполнение реального HTTP запроса с заголовками
+      let response = await fetchWithHeaders(currentUrl)
+      
+      scraper.stats.requestsCount += 1
+      
+      # Middleware: processResponse
+      var mutableResponse = response
+      scraper.loggingMiddleware.processResponse(request, mutableResponse)
+      
+      # Извлечение отзывов
+      let reviewsBefore = scraper.allReviews.len
+      let reviews = scraper.scrapePage(response)
+      scraper.allReviews.add reviews
+      let reviewsOnPage = scraper.allReviews.len - reviewsBefore
+      totalReviewsFound += reviewsOnPage
+      
+      # Проверка на пустые страницы
+      if reviewsOnPage == 0:
+        consecutiveEmptyPages += 1
+        echo "  ⚠️  No reviews found on this page"
+        if consecutiveEmptyPages >= 2:
+          echo "  ❌ Two consecutive empty pages, stopping"
+          break
+      else:
+        consecutiveEmptyPages = 0
+      
+      # Получение URL следующей страницы
+      var nextUrl = getNextPageUrl(response)
+      
+      # Fallback: если не нашли ключ пагинации, используем offset
+      if nextUrl.len == 0 and currentPage < MAX_PAGES and reviewsOnPage > 0:
+        let offset = currentPage * reviewsPerPage
+        nextUrl = REVIEWS_URL & "&start=" & $offset
+        echo "  → Using offset-based pagination: start=", offset
+      
+      currentUrl = nextUrl
+      
+      if currentUrl.len == 0 or currentPage >= MAX_PAGES:
+        if currentPage >= MAX_PAGES:
+          echo "  ℹ️  Reached maximum pages limit (", MAX_PAGES, ")"
+        break
+      
+      currentPage += 1
+      
+      # Задержка между запросами
+      if currentPage <= MAX_PAGES:
+        echo "  ⏳ Waiting ", REQUEST_DELAY, "ms before next page..."
+        await sleepAsync(REQUEST_DELAY)
+    
+    echo ""
+    echo "  ✅ Scraping complete: ", totalReviewsFound, " reviews found across ", currentPage, " pages"
   
   # scraper.stats.finish()
 
@@ -851,7 +1107,13 @@ when isMainModule:
 ##
 ## Настройка:
 ##   - MOVIE_ID - ID фильма на IMDB (например, "tt0181852")
-##   - MAX_PAGES - максимальное количество страниц для загрузки
-##   - REQUEST_DELAY - задержка между запросами в миллисекундах
+##   - LOAD_ALL_AT_ONCE - режим загрузки:
+##       * false = постраничная загрузка (РЕКОМЕНДУЕТСЯ, ~50 сек для всех отзывов)
+##       * true  = попытка загрузить всё сразу (НЕ РАБОТАЕТ - IMDB блокирует)
+##   - MAX_PAGES - максимальное количество страниц (рекомендуется 100+)
+##   - REQUEST_DELAY - задержка между запросами в мс (рекомендуется 500-1000)
+##
+## ПРИМЕЧАНИЕ: IMDB игнорирует параметр count и всегда возвращает ~25 отзывов на страницу.
+## Для получения всех отзывов используйте постраничную загрузку с LOAD_ALL_AT_ONCE = false
 ##
 ## ============================================================================
