@@ -24,13 +24,16 @@
 
 import nimbrowser
 import asyncdispatch
+import httpclient
 import strutils
 import times
 import json
 import re
 import tables
 import sets
-import httpclient
+import xmltree except innerText
+import htmlparser except normalizeWhitespace
+import streams
 
 # ============================================================================
 # КОНФИГУРАЦИЯ
@@ -40,7 +43,7 @@ const
   MOVIE_ID = "tt0181852"  # Terminator 3: Rise of the Machines
   BASE_URL = "https://www.imdb.com"
   REVIEWS_URL = BASE_URL & "/title/" & MOVIE_ID & "/reviews"
-  MAX_PAGES = 3  # Максимум страниц для скрейпинга
+  MAX_PAGES = 50  # Максимум страниц для скрейпинга (обычно ~25 отзывов на странице)
   REQUEST_DELAY = 2000  # Задержка между запросами в миллисекундах
 
 # ============================================================================
@@ -110,7 +113,7 @@ type
 
 method processRequest*(m: LoggingMiddleware,
                       req: var string,
-                      resp: var Response) =
+                      resp: var nimbrowser.Response) =
   m.requestCount += 1
   echo "┌────────────────────────────────────────────────────────────"
   echo "│ REQUEST #", m.requestCount
@@ -119,7 +122,7 @@ method processRequest*(m: LoggingMiddleware,
 
 method processResponse*(m: LoggingMiddleware,
                        req: string,
-                       resp: var Response) =
+                       resp: var nimbrowser.Response) =
   echo "┌────────────────────────────────────────────────────────────"
   echo "│ RESPONSE"
   echo "│ Status: ", resp.status
@@ -128,7 +131,7 @@ method processResponse*(m: LoggingMiddleware,
 
 method processRequest*(m: UserAgentMiddleware,
                       req: var string,
-                      resp: var Response) =
+                      resp: var nimbrowser.Response) =
   # В реальном приложении здесь бы устанавливался User-Agent
   discard
 
@@ -238,281 +241,380 @@ proc extractReviewData(scraper: IMDBReviewsScraper, reviewElement: Selector): It
   
   # ID отзыва (из data-review-id атрибута)
   let reviewNode = reviewElement.node
-  if not reviewNode.isNil:
-    let reviewId = reviewNode.getAttr("data-review-id", "")
-    if reviewId.len > 0:
-      result["review_id"] = %reviewId
+  if reviewNode.isNil:
+    echo "    ✗ reviewNode is nil"
+    return result
   
-  # Заголовок отзыва - несколько вариантов селекторов
-  var title = reviewElement.css("a.title").get()
-  if title.len == 0:
-    title = reviewElement.css(".review-summary").get()
-  if title.len > 0:
-    result["title"] = %title.strip()
+  let reviewId = reviewNode.getAttr("data-review-id", "")
+  if reviewId.len > 0:
+    result["review_id"] = %reviewId
+    echo "    • review_id: ", reviewId
   
-  # === РЕЙТИНГ ===
+  # === ИЗВЛЕЧЕНИЕ ДАННЫХ ЧЕРЕЗ ПОИСК В DOM ===
   
-  # Рейтинг пользователя (например, "8/10")
-  let ratingElements = reviewElement.css(".rating-other-user-rating span")
-  if not ratingElements.node.isNil:
-    let ratingText = ratingElements.get()
-    let ratingCleaned = extractRating(@[ratingText])
-    if ratingCleaned.len > 0 and ratingCleaned[0].len > 0:
-      result["rating"] = %ratingCleaned[0]
+  # Заголовок отзыва
+  for node in reviewNode.findAll("a"):
+    if node.kind == xnElement and node.attr("class").contains("title"):
+      let titleText = node.innerText().strip()
+      if titleText.len > 0:
+        result["title"] = %titleText
+        echo "    • title: ", titleText
+        break
   
-  # === ТЕКСТ ОТЗЫВА ===
+  # Рейтинг
+  for node in reviewNode.findAll("span"):
+    if node.kind == xnElement and node.attr("class").contains("rating-other-user-rating"):
+      for subNode in node.findAll("span"):
+        if subNode.kind == xnElement:
+          let ratingText = subNode.innerText().strip()
+          let pattern = re"(\d+)/10"
+          var matches: array[1, string]
+          if ratingText.find(pattern, matches) != -1:
+            result["rating"] = %matches[0]
+            echo "    • rating: ", matches[0]
+            break
+      break
   
-  # Полный текст отзыва
-  var reviewText = reviewElement.css(".text.show-more__control").get()
-  if reviewText.len == 0:
-    reviewText = reviewElement.css(".content .text").get()
-  if reviewText.len > 0:
-    result["review_text"] = %normalizeWhitespace(reviewText.strip())
+  # Текст отзыва
+  for node in reviewNode.findAll("div"):
+    if node.kind == xnElement and node.attr("class").contains("text") and node.attr("class").contains("show-more__control"):
+      let reviewText = node.innerText().strip()
+      if reviewText.len > 0:
+        result["review_text"] = %reviewText
+        echo "    • review_text: ", reviewText[0..min(50, reviewText.len-1)], "..."
+        break
   
-  # === ИНФОРМАЦИЯ ОБ АВТОРЕ ===
-  
-  # Имя автора
-  var author = reviewElement.css(".display-name-link").get()
-  if author.len == 0:
-    author = reviewElement.css("span[itemprop='author']").get()
-  if author.len > 0:
-    result["author"] = %author.strip()
-  
-  # Ссылка на профиль автора
-  let authorUrl = reviewElement.css(".display-name-link").attrib("href")
-  if authorUrl.len > 0:
-    let absoluteUrl = urljoin(BASE_URL, authorUrl)
-    result["author_url"] = %absoluteUrl
-  
-  # === ДАТА ПУБЛИКАЦИИ ===
+  # Автор
+  for node in reviewNode.findAll("span"):
+    if node.kind == xnElement and node.attr("class").contains("display-name-link"):
+      for linkNode in node.findAll("a"):
+        if linkNode.kind == xnElement:
+          let authorText = linkNode.innerText().strip()
+          if authorText.len > 0:
+            result["author"] = %authorText
+            echo "    • author: ", authorText
+          
+          # URL автора
+          let href = linkNode.attr("href")
+          if href.len > 0:
+            var authorUrl = href
+            if not authorUrl.startsWith("http"):
+              authorUrl = urljoin(BASE_URL, authorUrl)
+            result["author_url"] = %authorUrl
+            echo "    • author_url: ", authorUrl
+          break
+      break
   
   # Дата отзыва
-  let reviewDate = reviewElement.css(".review-date").get()
-  if reviewDate.len > 0:
-    result["review_date"] = %reviewDate.strip()
+  for node in reviewNode.findAll("span"):
+    if node.kind == xnElement and node.attr("class").contains("review-date"):
+      let dateText = node.innerText().strip()
+      if dateText.len > 0:
+        result["review_date"] = %dateText
+        echo "    • review_date: ", dateText
+        break
   
-  # === ПОЛЕЗНОСТЬ ОТЗЫВА ===
+  # Количество "полезных" голосов
+  for node in reviewNode.findAll("div"):
+    if node.kind == xnElement and node.attr("class").contains("actions") and node.attr("class").contains("text-muted"):
+      let helpfulText = node.innerText().strip()
+      if helpfulText.len > 0:
+        result["helpful_count"] = %helpfulText
+        echo "    • helpful_count: ", helpfulText
+        break
   
-  # Количество людей, которые нашли отзыв полезным
-  let helpfulText = reviewElement.css(".actions.text-muted").get()
-  if helpfulText.len > 0:
-    result["helpful_count"] = %helpfulText.strip()
+  # === SPOILER WARNING ===
   
-  # === СПОЙЛЕРЫ ===
+  # Извлечение spoiler информации (если есть)
+  var hasSpoiler = false
+  for node in reviewNode.findAll("span"):
+    if node.kind == xnElement and node.attr("class").contains("spoiler-warning"):
+      hasSpoiler = true
+      break
   
-  # Проверка на спойлеры
-  let hasSpoiler = not reviewElement.css(".spoiler-warning").node.isNil
   result["has_spoiler"] = %hasSpoiler
+  if hasSpoiler:
+    echo "    • has_spoiler: true"
   
-  echo "  ✓ Review extracted"
+  echo "    ✓ Data extracted"
 
-proc scrapePage(scraper: IMDBReviewsScraper, 
-                response: Response): seq[Item] =
+proc scrapePage(scraper: IMDBReviewsScraper, response: nimbrowser.Response): seq[Item] =
   ## Извлекает все отзывы со страницы
+  echo ""
+  echo "╔════════════════════════════════════════════════════════════════════"
+  echo "║ SCRAPING PAGE"
+  echo "╚════════════════════════════════════════════════════════════════════"
+  
   result = @[]
   
-  echo ""
-  echo "╔════════════════════════════════════════════════════════════"
-  echo "║ PARSING PAGE"
-  echo "╚════════════════════════════════════════════════════════════"
+  # Сохраним HTML для анализа (только первый раз)
+  if scraper.stats.requestsCount == 1:
+    try:
+      writeFile("imdb_page_debug.html", response.body)
+      echo "  [DEBUG] HTML saved to imdb_page_debug.html"
+    except:
+      discard
   
-  # Получаем корневой узел документа
-  if response.root.isNil:
-    echo "Error: Response root is nil"
-    return
+  # Создание селектора из HTML
+  let rootNode = parseHtml(response.body)
   
-  # CSS селектор для контейнера отзыва - работаем с XmlNode напрямую
-  let reviewNodes = response.root.querySelectorAll(".review-container")
+  # Поиск всех блоков с отзывами
+  echo "  → Searching for review elements..."
   
-  echo "Found ", reviewNodes.len, " reviews on this page"
-  echo ""
+  if rootNode.isNil:
+    echo "  ✓ Found 0 reviews"
+    return result
   
+  # IMDB изменил структуру - теперь используются другие классы
+  # Попробуем найти article элементы или div с data-testid
+  var reviewNodes: seq[XmlNode] = @[]
+  
+  # Вариант 1: ищем div с классом lister-item
+  for node in rootNode.findAll("div"):
+    if node.kind == xnElement:
+      let className = node.attr("class")
+      if className.contains("lister-item") or className.contains("review-container"):
+        reviewNodes.add(node)
+  
+  # Вариант 2: если не нашли, ищем article
+  if reviewNodes.len == 0:
+    for node in rootNode.findAll("article"):
+      if node.kind == xnElement:
+        reviewNodes.add(node)
+  
+  # Вариант 3: ищем div с data-testid="review-card"
+  if reviewNodes.len == 0:
+    for node in rootNode.findAll("div"):
+      if node.kind == xnElement:
+        if node.attr("data-testid").contains("review"):
+          reviewNodes.add(node)
+  
+  echo "  ✓ Found ", reviewNodes.len, " reviews"
+  
+  # Обработка каждого отзыва
   for i, reviewNode in reviewNodes:
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "Review #", i + 1
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "  ┌─ Processing review #", i + 1, " ────────────────────────────────"
     
-    # Создаём Selector из XmlNode
-    var reviewSelector = Selector()
-    new(reviewSelector)
-    reviewSelector.node = reviewNode
-    reviewSelector.response = response
-    reviewSelector.selectorType = stCss
+    # Создаём Selector из узла
+    let reviewElement = Selector(node: reviewNode)
     
-    var item = scraper.extractReviewData(reviewSelector)
+    # Извлечение данных
+    var item = scraper.extractReviewData(reviewElement)
     
     # Применение pipelines
-    var shouldSave = true
+    var shouldKeep = true
     
     # Pipeline 1: Validation
-    shouldSave = scraper.validationPipeline.processItem(item)
+    if not scraper.validationPipeline.processItem(item):
+      shouldKeep = false
     
-    if shouldSave:
-      # Pipeline 2: Deduplication
-      shouldSave = scraper.duplicatesPipeline.processItem(item)
+    # Pipeline 2: Deduplication
+    if shouldKeep and not scraper.duplicatesPipeline.processItem(item):
+      shouldKeep = false
     
-    if shouldSave:
-      # Pipeline 3: Enrichment
-      shouldSave = scraper.enrichmentPipeline.processItem(item)
+    # Pipeline 3: Enrichment
+    if shouldKeep and not scraper.enrichmentPipeline.processItem(item):
+      shouldKeep = false
     
-    if shouldSave:
+    if shouldKeep:
       result.add item
       scraper.stats.itemsScraped += 1
-      echo "  ✓ Review saved"
+      echo "  │ ✓ Review added to results"
+    else:
+      echo "  │ ✗ Review filtered out"
     
-    echo ""
-
-proc getNextPageUrl(response: Response): string =
-  ## Извлекает URL следующей страницы
-  let nextButton = response.css(".load-more-trigger")
-  if not nextButton.node.isNil:
-    let nextKey = nextButton.attrib("data-key")
-    if nextKey.len > 0:
-      return REVIEWS_URL & "/_ajax?paginationKey=" & nextKey
-  return ""
-
-# ============================================================================
-# MOCK DATA - Для демонстрации без реальных запросов
-# ============================================================================
-
-proc createMockResponse(pageNum: int): Response =
-  ## Создаёт mock Response с примером HTML структуры IMDB
-  let mockHtml = """
-  <html>
-  <body>
-    <div class="review-container" data-review-id="rw123456""" & $pageNum & """">
-      <div class="review-header">
-        <a class="title" href="/review/rw123456""" & $pageNum & """">
-          Best action movie of 2003!
-        </a>
-        <span class="rating-other-user-rating">
-          <span>9</span>/10
-        </span>
-      </div>
-      <div class="content">
-        <div class="text show-more__control">
-          This movie is absolutely fantastic! Arnold Schwarzenegger returns as the T-800 in an epic battle. 
-          The action sequences are intense and well-choreographed. The plot keeps you on the edge of your seat. 
-          Highly recommended for Terminator fans!
-        </div>
-        <div class="review-author">
-          <span itemprop="author">
-            <a class="display-name-link" href="/user/ur12345""" & $pageNum & """">
-              JohnDoe""" & $pageNum & """
-            </a>
-          </span>
-        </div>
-        <span class="review-date">15 January 2020</span>
-        <div class="actions text-muted">
-          542 out of 678 found this helpful
-        </div>
-      </div>
-    </div>
-    
-    <div class="review-container" data-review-id="rw234567""" & $pageNum & """">
-      <div class="review-header">
-        <a class="title" href="/review/rw234567""" & $pageNum & """">
-          Good but not great
-        </a>
-        <span class="rating-other-user-rating">
-          <span>6</span>/10
-        </span>
-      </div>
-      <div class="content">
-        <div class="text show-more__control">
-          The movie has great action scenes, but the plot is a bit predictable.
-          Arnold is good, but I expected more character development.
-        </div>
-        <div class="spoiler-warning">Warning: Contains spoilers</div>
-        <div class="review-author">
-          <span itemprop="author">
-            <a class="display-name-link" href="/user/ur67890""" & $pageNum & """">
-              MovieCritic""" & $pageNum & """
-            </a>
-          </span>
-        </div>
-        <span class="review-date">22 March 2019</span>
-        <div class="actions text-muted">
-          123 out of 234 found this helpful
-        </div>
-      </div>
-    </div>
-    
-    <div class="review-container" data-review-id="rw345678""" & $pageNum & """">
-      <div class="review-header">
-        <a class="title" href="/review/rw345678""" & $pageNum & """">
-          Amazing sci-fi action!
-        </a>
-        <span class="rating-other-user-rating">
-          <span>10</span>/10
-        </span>
-      </div>
-      <div class="content">
-        <div class="text show-more__control">
-          Perfect movie from start to finish. The special effects are incredible, 
-          the soundtrack is memorable, and the story is engaging. 
-          This is how sci-fi action should be made!
-        </div>
-        <div class="review-author">
-          <span itemprop="author">
-            <a class="display-name-link" href="/user/ur11111""" & $pageNum & """">
-              ActionFan""" & $pageNum & """
-            </a>
-          </span>
-        </div>
-        <span class="review-date">5 July 2018</span>
-        <div class="actions text-muted">
-          892 out of 945 found this helpful
-        </div>
-      </div>
-    </div>
-    
-    """ & (if pageNum < MAX_PAGES: """<button class="load-more-trigger" data-key="page""" & $(pageNum + 1) & """"></button>""" else: "") & """
-  </body>
-  </html>
-  """
+    echo "  └─", "─".repeat(60)
   
-  result = newResponse(
-    url = REVIEWS_URL & (if pageNum > 1: "?page=" & $pageNum else: ""),
-    status = 200,
-    headers = newHttpHeaders(),
-    body = mockHtml
-  )
+  echo ""
+  echo "  📊 Page summary: ", result.len, " reviews accepted, ",
+       reviewNodes.len - result.len, " filtered out"
+
+proc getNextPageUrl(response: nimbrowser.Response): string =
+  ## Получает URL следующей страницы из пагинации
+  result = ""
+  
+  let rootNode = parseHtml(response.body)
+  if rootNode.isNil:
+    return result
+  
+  # IMDB использует data-key для пагинации в атрибуте кнопки Load More
+  # Ищем кнопку с классом load-more-data
+  for node in rootNode.findAll("button"):
+    if node.kind == xnElement:
+      let className = node.attr("class")
+      if className.contains("load-more-data") or className.contains("ipc-see-more"):
+        let dataKey = node.attr("data-key")
+        if dataKey.len > 0:
+          # Формируем URL для следующей страницы
+          result = REVIEWS_URL & "?paginationKey=" & dataKey
+          return result
+  
+  # Альтернативный поиск через div с id load-more-trigger
+  for node in rootNode.findAll("div"):
+    if node.kind == xnElement:
+      if node.attr("id") == "load-more-trigger":
+        let dataKey = node.attr("data-key")
+        if dataKey.len > 0:
+          result = REVIEWS_URL & "?paginationKey=" & dataKey
+          return result
+
+proc createMockResponse(pageNum: int): nimbrowser.Response =
+  ## Создаёт mock ответ для демонстрации
+  new(result)
+  result.url = REVIEWS_URL
+  result.status = 200
+  result.encoding = "utf-8"
+  result.meta = initTable[string, string]()
+  result.body = """
+<html>
+<body>
+  <div class="review-container" data-review-id="rv123456">
+    <div class="lister-item-content">
+      <a class="title">Great action sequences!</a>
+      <span class="rating-other-user-rating">
+        <span>8/10</span>
+      </span>
+      <div class="text show-more__control">
+        This is one of the most underrated Terminator movies. The action is spectacular 
+        and the special effects still hold up today. Arnold Schwarzenegger gives a solid 
+        performance as always. While it may not reach the heights of T2, it's still a 
+        very entertaining film that delivers on the promise of robot action.
+      </div>
+      <span class="display-name-link">
+        <a href="/user/ur12345678/">ActionFan2003</a>
+      </span>
+      <span class="review-date">15 July 2003</span>
+      <div class="actions text-muted">125 out of 150 found this helpful</div>
+    </div>
+  </div>
+  
+  <div class="review-container" data-review-id="rv123457">
+    <div class="lister-item-content">
+      <a class="title">Not as good as T2, but still fun</a>
+      <span class="rating-other-user-rating">
+        <span>6/10</span>
+      </span>
+      <div class="text show-more__control">
+        After the masterpiece that was Terminator 2, this third installment feels 
+        somewhat unnecessary. However, if you can look past that, there's still 
+        plenty to enjoy here. The chase scenes are well-done and the darker ending 
+        was a nice surprise. Worth watching for fans of the franchise.
+      </div>
+      <span class="display-name-link">
+        <a href="/user/ur87654321/">MovieBuff1999</a>
+      </span>
+      <span class="review-date">22 July 2003</span>
+      <div class="actions text-muted">89 out of 120 found this helpful</div>
+      <span class="spoiler-warning">Contains spoilers</span>
+    </div>
+  </div>
+  
+  <div class="review-container" data-review-id="rv123458">
+    <div class="lister-item-content">
+      <a class="title">Disappointing sequel</a>
+      <span class="rating-other-user-rating">
+        <span>4/10</span>
+      </span>
+      <div class="text show-more__control">
+        I had high hopes for this movie, but it just doesn't capture the magic 
+        of the first two films. The plot feels recycled and the new characters 
+        aren't very interesting. Some decent action scenes can't save this from 
+        being a mediocre entry in the series.
+      </div>
+      <span class="display-name-link">
+        <a href="/user/ur11223344/">CriticCorner</a>
+      </span>
+      <span class="review-date">1 August 2003</span>
+      <div class="actions text-muted">45 out of 95 found this helpful</div>
+    </div>
+  </div>
+</body>
+</html>
+"""
+  result.headers = newHttpHeaders({"Content-Type": "text/html; charset=utf-8"})
+
+# ============================================================================
+# HTTP REQUEST HELPERS
+# ============================================================================
+
+proc fetchWithHeaders(url: string): Future[nimbrowser.Response] {.async.} =
+  ## Выполняет HTTP запрос с необходимыми заголовками
+  var headers = newHttpHeaders({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1"
+  })
+  
+  var client = newAsyncHttpClient()
+  client.headers = headers
+  
+  try:
+    let httpResponse = await client.get(url)
+    let bodyText = await httpResponse.body
+    
+    # Создаём Response объект NimBrowser
+    new(result)
+    result.url = url
+    result.status = httpResponse.code.int
+    result.body = bodyText
+    result.encoding = "utf-8"
+    result.meta = initTable[string, string]()
+    
+    # Копируем заголовки ответа
+    for key, val in httpResponse.headers.table:
+      result.meta[key] = val.join("; ")
+    
+    client.close()
+  except Exception as e:
+    echo "Error fetching URL: ", e.msg
+    # Возвращаем пустой ответ с ошибкой
+    new(result)
+    result.url = url
+    result.status = 500
+    result.body = ""
+    result.encoding = "utf-8"
+    result.meta = initTable[string, string]()
+    client.close()
+
+# ============================================================================
+# SCRAPING LOGIC
+# ============================================================================
 
 proc scrapeAllPages(scraper: IMDBReviewsScraper) {.async.} =
-  ## Скрейпит все страницы с отзывами
+  ## Скрейпит все доступные страницы с отзывами
   echo "╔════════════════════════════════════════════════════════════════════"
-  echo "║ STARTING SCRAPING SESSION"
-  echo "║ Movie: Terminator 3: Rise of the Machines (2003)"
-  echo "║ URL: ", REVIEWS_URL
-  echo "║ Max pages: ", MAX_PAGES
+  echo "║ STARTING SCRAPING PROCESS"
   echo "╚════════════════════════════════════════════════════════════════════"
   echo ""
+  echo "  🎯 Target: ", REVIEWS_URL
+  echo "  📄 Max pages: ", MAX_PAGES
+  echo "  ⏱️  Delay: ", REQUEST_DELAY, "ms"
+  echo ""
   
-  var currentPage = 1
   var currentUrl = REVIEWS_URL
+  var currentPage = 1
   
-  while currentPage <= MAX_PAGES:
+  while currentUrl.len > 0:
     echo "╔════════════════════════════════════════════════════════════════════"
-    echo "║ PAGE ", currentPage, " / ", MAX_PAGES
+    echo "║ PAGE #", currentPage
     echo "╚════════════════════════════════════════════════════════════════════"
     
     # Middleware: processRequest
     var request = currentUrl
-    var dummyResponse: Response
+    var dummyResponse = new(nimbrowser.Response)
     scraper.loggingMiddleware.processRequest(request, dummyResponse)
-    scraper.userAgentMiddleware.processRequest(request, dummyResponse)
     
-    # В реальном приложении здесь был бы fetchAsync
-    # let response = await fetchAsync(currentUrl)
-    
-    # Для демонстрации используем mock данные
-    let response = createMockResponse(currentPage)
+    # Выполнение реального HTTP запроса с заголовками
+    let response = await fetchWithHeaders(currentUrl)
     
     scraper.stats.requestsCount += 1
     
     # Middleware: processResponse
-    scraper.loggingMiddleware.processResponse(request, response)
+    var mutableResponse = response
+    scraper.loggingMiddleware.processResponse(request, mutableResponse)
     
     # Извлечение отзывов
     let reviews = scraper.scrapePage(response)
@@ -531,7 +633,7 @@ proc scrapeAllPages(scraper: IMDBReviewsScraper) {.async.} =
       echo "⏳ Waiting ", REQUEST_DELAY, "ms before next page..."
       await sleepAsync(REQUEST_DELAY)
   
-  scraper.stats.finish()
+  # scraper.stats.finish()
 
 # ============================================================================
 # EXPORT AND REPORTING
@@ -576,7 +678,7 @@ proc printStatistics(scraper: IMDBReviewsScraper) =
   echo ""
   echo "  📊 Total requests:      ", scraper.stats.requestsCount
   echo "  📝 Reviews scraped:     ", scraper.stats.itemsScraped
-  echo "  ⏱️  Duration:            ", scraper.stats.duration()
+  # echo "  ⏱️  Duration:            ", scraper.stats.duration()
   echo "  🎯 Success rate:        ", 
     if scraper.stats.requestsCount > 0:
       formatFloat(
@@ -731,7 +833,7 @@ when isMainModule:
 ## ИНСТРУКЦИИ ПО ЗАПУСКУ
 ## ============================================================================
 ##
-## 1. Убедитесь, что у вас установлен Nim (версия 1.6.0 или выше)
+## 1. Убедитесь, что у вас установлен Nim (версия 2.2.6 или выше)
 ##
 ## 2. Скомпилируйте программу:
 ##    nim c -d:release imdb_reviews_scraper.nim
@@ -739,11 +841,17 @@ when isMainModule:
 ## 3. Запустите:
 ##    ./imdb_reviews_scraper
 ##
-## ПРИМЕЧАНИЕ: Этот пример использует mock данные для демонстрации.
-## Для реального скрейпинга IMDB:
-##   - Раскомментируйте строку с fetchAsync()
-##   - Убедитесь, что соблюдаете robots.txt
-##   - Используйте разумные задержки между запросами
-##   - Добавьте обработку ошибок и повторные попытки
+## ПРИМЕЧАНИЕ: Программа выполняет реальные HTTP-запросы к IMDB.
+## Рекомендации:
+##   - Соблюдайте robots.txt сайта IMDB
+##   - Используйте разумные задержки между запросами (по умолчанию 2000мс)
+##   - Настройте MAX_PAGES для ограничения количества загружаемых страниц
+##   - При необходимости добавьте обработку ошибок и повторные попытки
+##   - Будьте уважительны к серверам IMDB - не создавайте чрезмерную нагрузку
+##
+## Настройка:
+##   - MOVIE_ID - ID фильма на IMDB (например, "tt0181852")
+##   - MAX_PAGES - максимальное количество страниц для загрузки
+##   - REQUEST_DELAY - задержка между запросами в миллисекундах
 ##
 ## ============================================================================

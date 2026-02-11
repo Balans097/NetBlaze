@@ -50,7 +50,8 @@
 
 
 import std/[xmltree, strutils, strtabs, unicode, sets, tables, re, 
-            uri, json, times, httpclient, asyncdispatch, sequtils]
+            uri, json, times, asyncdispatch, sequtils]
+import httpclient
 import htmlparser
 
 
